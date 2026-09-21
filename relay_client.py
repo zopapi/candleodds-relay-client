@@ -12,16 +12,24 @@ What it does, in a loop:
 
 What it never does:
   * no selling, ever -- filled positions are held until the market resolves
-    (there is no sell code in this file; tests/test_client.py enforces that)
+    (there is no sell code in this file; tests/test_client.py enforces that).
+    The only thing that closes a position is REDEEMING it after resolution
+    (the redemption sweep below), which pays out USDC; it is not a sale.
   * no decisions -- direction, price cap, stake and timing all come from the
     relay; this program only executes them
   * your private key never leaves this process (it is redacted from logs and
     is never sent to the relay)
 
-DRY_RUN (default TRUE) gates exactly one thing: the order call. Everything
-else -- polling, Polymarket login, book pricing, fill reporting -- runs live.
-In dry-run the order is priced against the live book and logged, then a
-zero-size "cancelled" report is sent so you can see the whole path work.
+DRY_RUN (default TRUE) gates the two calls that change your account: placing
+an order, and redeeming a resolved position. Everything else -- polling,
+Polymarket login, book pricing, fill reporting, listing redeemable positions --
+runs live. In dry-run the order is priced against the live book and logged,
+then a zero-size "cancelled" report is sent so you can see the whole path
+work; the redemption sweep logs what it WOULD redeem.
+
+REDEMPTION SWEEP: every REDEEM_CHECK_EVERY_SECONDS (default 60, 0 = off) it
+redeems every REDEEMABLE position on the account, gaslessly. That is the whole
+account, not only what this program bought -- use a wallet dedicated to it.
 
 Environment variables: see .env.example.
 
@@ -62,6 +70,8 @@ MIN_GTD_SECONDS = 190
 GTD_TTL_MARGIN_SECONDS = 125   # expiration >= ttl_sec + this, so backstop > ttl
 
 MONITOR_TICK_SECONDS = 2
+REDEEM_RETRY_SECONDS = 600   # after a failed redeem, leave that market alone this long
+MAX_REDEEMS_PER_SWEEP = 5    # each redeem blocks on wait(); bound how long one sweep can take
 HEARTBEAT_SECONDS = 60
 MAX_FINALIZE_ATTEMPTS = 10
 
@@ -113,6 +123,7 @@ class Config:
     dry_run: bool
     max_stake: Decimal
     poll_seconds: float
+    redeem_every: float = 60.0   # seconds between redemption sweeps; 0 = off
 
 
 def load_config(env):
@@ -133,10 +144,13 @@ def load_config(env):
     try:
         max_stake = Decimal((env.get("MAX_STAKE_USDC") or "5").strip())
         poll_seconds = float((env.get("POLL_INTERVAL_SECONDS") or "5").strip())
+        redeem_every = float((env.get("REDEEM_CHECK_EVERY_SECONDS") or "60").strip())
     except Exception:
-        fatal("MAX_STAKE_USDC / POLL_INTERVAL_SECONDS must be numbers")
+        fatal("MAX_STAKE_USDC / POLL_INTERVAL_SECONDS / REDEEM_CHECK_EVERY_SECONDS must be numbers")
     if max_stake <= 0 or poll_seconds < 1:
         fatal("MAX_STAKE_USDC must be > 0 and POLL_INTERVAL_SECONDS must be >= 1")
+    if redeem_every != 0 and redeem_every < 10:
+        fatal("REDEEM_CHECK_EVERY_SECONDS must be 0 (off) or at least 10")
 
     return Config(
         relay_url=env["RELAY_URL"].strip().rstrip("/"),
@@ -146,6 +160,7 @@ def load_config(env):
         dry_run=dry_run,
         max_stake=max_stake,
         poll_seconds=poll_seconds,
+        redeem_every=redeem_every,
     )
 
 
@@ -201,6 +216,9 @@ class Client:
         self.pending = []        # orders placed, not yet finalized
         self.last_heartbeat = 0.0
         self.last_status = "starting"
+        self.last_redeem = 0.0
+        self.redeem_retry_at = {}      # condition_id -> earliest next attempt
+        self.redeem_dry_logged = set() # dry-run: log each market once
 
     # -- relay ----------------------------------------------------------------
 
@@ -498,6 +516,68 @@ class Client:
             self.report_fill(p["sig"], fill, price)
             self.pending.remove(p)
 
+    # -- redemption -----------------------------------------------------------
+
+    def maybe_redeem(self):
+        every = self.cfg.redeem_every
+        if every <= 0 or self.clock() - self.last_redeem < every:
+            return
+        if self.pending:
+            # redeem_positions(...).wait() can block; never let it delay the
+            # TTL cancel of an order in flight. Try again on the next tick.
+            return
+        self.last_redeem = self.clock()
+        self.redeem_sweep()
+
+    def redeem_sweep(self):
+        """Redeem every REDEEMABLE position on the account, once per market.
+        A periodic sweep instead of tracked state: this program keeps no
+        database, and on-chain 'redeemable' is the source of truth, so
+        re-sweeping is safe across restarts. Covers the WHOLE account, not only
+        what this program bought. Redeeming pays out resolved positions; it
+        never sells. Positions worth $0 (losers) are left alone."""
+        try:
+            positions = list(self.pm.list_positions(status="REDEEMABLE").iter_items())
+        except Exception as e:
+            log(f"redeem sweep: could not list positions ({type(e).__name__}: {e})")
+            return
+        seen = set()
+        attempted = 0
+        for pos in positions:
+            cid = pos.condition_id
+            if not cid or cid in seen:
+                continue
+            # Guards found by checking against a real account: the status filter
+            # alone is not trusted (status=OPEN returned the same rows), and old
+            # losing positions stay "redeemable" at $0.00 forever -- redeeming
+            # those pays nothing, and hundreds of them would block this loop.
+            if not getattr(pos, "redeemable", True):
+                continue
+            if Decimal(str(getattr(pos, "current_value", 1) or 0)) <= 0:
+                continue
+            seen.add(cid)
+            if attempted >= MAX_REDEEMS_PER_SWEEP:
+                break
+            if self.redeem_retry_at.get(cid, 0) > self.clock():
+                continue
+            label = f"{getattr(pos, 'title', None) or cid} [{getattr(pos, 'outcome', '?')}]"
+            if self.cfg.dry_run:
+                if cid not in self.redeem_dry_logged:
+                    self.redeem_dry_logged.add(cid)
+                    log(f"DRY RUN: would redeem {label} -- no transaction sent")
+                continue
+            attempted += 1
+            try:
+                handle = self.pm.redeem_positions(condition_id=cid)
+                outcome = handle.wait()
+                tx = str(getattr(outcome, "transaction_hash", "") or "")
+                log(f"redeemed {label} (tx {tx})")
+                self.redeem_retry_at.pop(cid, None)
+            except Exception as e:
+                self.redeem_retry_at[cid] = self.clock() + REDEEM_RETRY_SECONDS
+                log(f"redeem failed for {label}: {type(e).__name__}: {e}; "
+                    f"retrying in {REDEEM_RETRY_SECONDS}s")
+
     # -- main loop ------------------------------------------------------------
 
     def cycle(self):
@@ -522,6 +602,7 @@ class Client:
         for sig in signals:
             self.handle_signal(sig)
         self.monitor(halt)
+        self.maybe_redeem()
 
     def run(self):
         while True:
@@ -580,7 +661,8 @@ def main(argv):
         log(f"WARNING: relay not reachable yet ({type(e).__name__}: {e}); will keep trying")
 
     log(f"started: {'DRY RUN -- no orders will be placed' if cfg.dry_run else 'LIVE -- real orders will be placed'}; "
-        f"stake cap {cfg.max_stake} USDC; relay {cfg.relay_url}")
+        f"stake cap {cfg.max_stake} USDC; relay {cfg.relay_url}; redemption sweep "
+        f"{'every ' + str(int(cfg.redeem_every)) + 's' if cfg.redeem_every else 'OFF'}")
     client.run()
 
 

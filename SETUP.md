@@ -6,6 +6,17 @@ account. Log lines quoted below are copied from real runs of this code.
 > Railway's button and tab names are written from memory of its dashboard;
 > expect small differences.
 
+## Two things to know first
+
+- **Deploy in the EU West region on Railway.** Other regions can authenticate
+  fine and then fail on order placement, in a way that looks like a bug in the
+  program rather than a region block (observed by the relay operator). Step 2
+  shows where to set it.
+- **Use a Polymarket wallet dedicated to this program.** It redeems *every*
+  winning position on the account, including ones you bought by hand. Fund the
+  account with only what you're putting behind these signals, or turn the sweep
+  off (`REDEEM_CHECK_EVERY_SECONDS=0`).
+
 ## What you need before starting
 
 - A Polymarket account created on the website, **funded with USDC**, and **one
@@ -26,6 +37,11 @@ On this repository's page click **Fork** and create the fork under your account.
 
 ## 2. Create the Railway service
 Railway → **New Project** → **Deploy from GitHub repo** → pick your fork.
+
+**Set the region now:** service → **Settings** → deployment region → **EU West**.
+Do this before relying on any deploy; if the first build has already started,
+change the region and redeploy.
+
 The first build will start and then **fail** with
 `FATAL: missing environment variable(s): …`. That's expected: nothing is set
 yet. The start command comes from `railway.json` (`python relay_client.py`);
@@ -41,6 +57,7 @@ no spaces, **no quote marks**.
 | 2 | `RELAY_CLIENT_TOKEN` | the 64-character token | Wrong or revoked → `401`. |
 | 3 | `DRY_RUN` | `true` | Only `true` / `false` are accepted; a typo like `flase` stops the program instead of guessing. Unset also means dry-run. |
 | 4 | `MAX_STAKE_USDC` | `5` | Your own ceiling per signal; the smaller of this and the relay's cap wins. |
+| — | `REDEEM_CHECK_EVERY_SECONDS` | leave unset (60) | Optional. `0` turns the redemption sweep off. |
 | 5 | `POLYMARKET_PROXY_WALLET` | your `0x…` deposit address | |
 | 6 | `POLYMARKET_PRIVATE_KEY` | your exported key — **last, entered privately** | Redacted from logs; never sent to the relay. |
 
@@ -51,7 +68,7 @@ Healthy start:
 ```
 … Polymarket login OK for wallet 0x…
 … balance 25.00 USDC; trading approvals set
-… started: DRY RUN -- no orders will be placed; stake cap 5 USDC; relay https://…
+… started: DRY RUN -- no orders will be placed; stake cap 5 USDC; relay https://…; redemption sweep every 60s
 … relay: ok halt=False signals=0 | pending orders=0 | DRY RUN
 ```
 That last line repeats about once a minute — it means the token was accepted
@@ -92,7 +109,9 @@ When a signal does arrive:
 … reported cancelled btc up size=0.0 price=None (fill id 12)
 ```
 That shows polling, pricing against the live order book, and reporting all
-working — everything except the order call. (In dry-run the report is a
+working — everything except the order call. In dry-run the redemption sweep also
+only *lists* what it would redeem (`DRY RUN: would redeem … -- no transaction
+sent`); it sends nothing. (In dry-run the report is a
 zero-size `cancelled`; the relay operator will see it on their side.)
 
 ## 7. Go live
@@ -126,12 +145,13 @@ actually bought.
   price, sized `min(relay stake, MAX_STAKE_USDC) / price`. If the live best ask
   is above the cap, the order rests instead of crossing and is cancelled at the
   signal's `ttl_sec` (60s).
-- **Never sells.** No sell, market-order or position-closing code exists (a test
-  enforces it). Positions are held until the market resolves.
-- **Winnings are not redeemed by this program.** After a market resolves,
-  winning shares must be turned into USDC. I haven't verified whether Polymarket
-  does that automatically for your account type; if it doesn't, use *Claim* on
-  polymarket.com.
+- **Never sells.** No sell or market-order code exists (a test enforces it).
+  Positions are held until the market resolves, then redeemed (below).
+- **Redeems winnings** (every 60s, live mode only): after a market resolves,
+  winning positions are turned into USDC, gaslessly. It covers the whole account
+  (see the dedicated-wallet note), skips worthless positions, redeems at most 5
+  per pass, and after a failure leaves that market alone for 10 minutes. This
+  pays out resolved positions; it is not a sale.
 - **Never orders a window twice:** it claims the signal before the order call,
   and refuses if the exchange already shows an open order or trade on that
   market, so a restart or redeploy can't double up.
@@ -155,5 +175,9 @@ throwaway key (login, live book pricing, dry-run end to end, order rejection
 handling, no secrets in logs), and `test_order.py` steps 1–6 on a real funded
 account (2026-09-21).
 
+The redemption sweep is covered by unit tests, and its position-listing call was
+checked against the live API (read-only).
+
 **Not yet verified:** a real fill through this client, i.e. its exchange-confirmed
-fill price/size accounting against real trade records.
+fill price/size accounting against real trade records, and an actual redemption
+transaction on a resolved winning position.

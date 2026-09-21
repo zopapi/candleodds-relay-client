@@ -87,7 +87,8 @@ class Items:
 
 class FakePM:
     ALLOWED = {"get_order_book", "place_limit_order", "get_order", "cancel_order",
-               "list_open_orders", "list_account_trades", "get_balance_allowance"}
+               "list_open_orders", "list_account_trades", "get_balance_allowance",
+               "list_positions", "redeem_positions"}
 
     def __init__(self, clock=None):
         self.clock = clock
@@ -102,6 +103,9 @@ class FakePM:
         self.tick, self.min_size = "0.01", "5"
         self.asks = ["0.53"]
         self.order_counter = 0
+        self.positions = []            # redeemable positions the account "has"
+        self.list_positions_error = None
+        self.redeem_error = None
 
     def __getattr__(self, name):
         raise AssertionError(f"client called a Polymarket method outside the allowlist: {name}")
@@ -153,6 +157,23 @@ class FakePM:
         self._rec("cancel_order", **kw)
         self.status = "CANCELED"
         return NS(canceled=[kw["order_id"]])
+
+    def list_positions(self, *, status=None):
+        # Mirrors polymarket-client 0.10.0: `status=` exists, `redeemable=` does not
+        # (passing it raises TypeError, exactly like the real SDK).
+        self._rec("list_positions", status=status)
+        assert status == "REDEEMABLE"
+        if self.list_positions_error:
+            raise self.list_positions_error
+        return Items(self.positions)
+
+    def redeem_positions(self, *, condition_id):
+        self._rec("redeem_positions", condition_id=condition_id)
+        if self.redeem_error:
+            raise self.redeem_error
+        # like a real account: once redeemed, the position is gone
+        self.positions = [p for p in self.positions if p.condition_id != condition_id]
+        return NS(wait=lambda: NS(transaction_hash="0xtx" + condition_id[-4:]))
 
     def n(self, name):
         return sum(1 for c, _ in self.calls if c == name)
@@ -538,3 +559,104 @@ def test_run_mode_test_order_dispatches_and_never_enters_the_loop(monkeypatch):
     with pytest.raises(SystemExit) as e:
         rc.main([])
     assert called == {"z": True} and e.value.code == 0
+
+
+# --------------------------------------------------------------------------
+# Redemption sweep
+# --------------------------------------------------------------------------
+
+def position(cid, title="BTC 15m", outcome="Up", value=5.0, redeemable=True):
+    return NS(condition_id=cid, title=title, outcome=outcome, current_value=value, redeemable=redeemable)
+
+
+def test_sweep_redeems_each_redeemable_market_once_using_the_0_10_api(env):
+    env.pm.positions = [position("0xc1"), position("0xc2"), position("0xc1", outcome="Down")]
+    c = env.build()
+    c.cycle()
+    assert [kw for n, kw in env.pm.calls if n == "list_positions"] == [{"status": "REDEEMABLE"}]
+    assert [kw["condition_id"] for n, kw in env.pm.calls if n == "redeem_positions"] == ["0xc1", "0xc2"]
+
+
+def test_sweep_is_throttled_to_the_configured_interval(env):
+    c = env.build()
+    c.cycle()
+    env.clock.sleep(30)
+    c.cycle()
+    assert env.pm.n("list_positions") == 1
+    env.clock.sleep(31)
+    c.cycle()
+    assert env.pm.n("list_positions") == 2
+
+
+def test_dry_run_lists_but_never_redeems_and_logs_each_market_once(env, capsys):
+    env.pm.positions = [position("0xc1", title="BTC 12:00")]
+    c = env.build(dry_run=True)
+    for _ in range(3):
+        c.cycle(); env.clock.sleep(61)
+    assert env.pm.n("list_positions") == 3 and env.pm.n("redeem_positions") == 0
+    assert capsys.readouterr().out.count("would redeem BTC 12:00") == 1
+
+
+def test_failed_redeem_backs_off_then_retries(env):
+    env.pm.positions = [position("0xc1")]
+    env.pm.redeem_error = RuntimeError("relayer down")
+    c = env.build()
+    c.cycle()
+    for _ in range(3):                                     # 3 more sweeps inside the 600s back-off
+        env.clock.sleep(61); c.cycle()
+    assert env.pm.n("redeem_positions") == 1
+    env.pm.redeem_error = None
+    env.clock.sleep(600); c.cycle()
+    assert env.pm.n("redeem_positions") == 2
+
+
+def test_sweep_waits_while_an_order_is_in_flight(env):
+    env.pm.positions = [position("0xc1")]
+    env.relay.signals_payload = {"halt": False, "signals": [sig(ttl=60)]}
+    c = env.build()
+    c.cycle()
+    assert len(c.pending) == 1 and env.pm.n("list_positions") == 0   # blocked, order first
+    env.relay.signals_payload = {"halt": False, "signals": []}
+    env.clock.sleep(61); c.cycle()                                    # ttl cancel finalizes it
+    env.clock.sleep(2); c.cycle()
+    assert c.pending == [] and env.pm.n("redeem_positions") == 1
+
+
+def test_sweep_can_be_switched_off(env):
+    env.pm.positions = [position("0xc1")]
+    c = env.build()
+    c.cfg.redeem_every = 0
+    c.cycle()
+    assert env.pm.n("list_positions") == 0
+
+
+def test_listing_failure_does_not_break_the_cycle(env):
+    env.pm.list_positions_error = TimeoutError("api down")
+    env.relay.signals_payload = {"halt": False, "signals": [sig()]}
+    c = env.build()
+    c.cycle()
+    assert env.pm.n("place_limit_order") == 1              # trading unaffected
+
+
+def test_redeem_config_parsing():
+    assert rc.load_config(dict(BASE_ENV)).redeem_every == 60
+    assert rc.load_config({**BASE_ENV, "REDEEM_CHECK_EVERY_SECONDS": "0"}).redeem_every == 0
+    with pytest.raises(SystemExit):
+        rc.load_config({**BASE_ENV, "REDEEM_CHECK_EVERY_SECONDS": "3"})
+
+
+def test_sweep_skips_worthless_and_non_redeemable_positions(env):
+    env.pm.positions = [position("0xlost", value=0.0), position("0xopen", redeemable=False),
+                        position("0xwon", value=9.09)]
+    env.build().cycle()
+    assert [kw["condition_id"] for n, kw in env.pm.calls if n == "redeem_positions"] == ["0xwon"]
+
+
+def test_sweep_caps_redeems_per_pass_so_it_cannot_block_for_long(env):
+    env.pm.positions = [position(f"0xc{i}") for i in range(12)]
+    c = env.build()
+    c.cycle()
+    assert env.pm.n("redeem_positions") == rc.MAX_REDEEMS_PER_SWEEP
+    env.clock.sleep(61); c.cycle()                        # the rest are picked up on later sweeps
+    done = [kw["condition_id"] for n, kw in env.pm.calls if n == "redeem_positions"]
+    assert len(done) == 2 * rc.MAX_REDEEMS_PER_SWEEP and len(set(done)) == len(done)   # all distinct
