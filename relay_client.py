@@ -53,9 +53,11 @@ MAX_SIGNAL_FUTURE_SECONDS = 60
 
 # Exchange-side expiry backstop on every order, in case this process dies
 # before it can cancel. polymarket-client 0.10.0 refuses any expiration less
-# than 180s out (found by running against the live SDK), and the exchange
-# itself treats an order as expired 60s BEFORE its stated expiration -- so this
-# leaves a ~130s backstop, comfortably longer than any relay ttl_sec.
+# than 180s out (found by running against the live SDK). The exchange accepted
+# a 190s expiration and recorded it as sent. Polymarket's docs describe a
+# one-minute GTD threshold that would shorten the real backstop to ~130s;
+# that is not verified, so the backstop is somewhere between ~130s and 190s,
+# either way longer than any relay ttl_sec.
 MIN_GTD_SECONDS = 190
 GTD_TTL_MARGIN_SECONDS = 125   # expiration >= ttl_sec + this, so backstop > ttl
 

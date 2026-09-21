@@ -111,7 +111,7 @@ actually bought.
 ## 8. Stopping
 - **You stop:** set `DRY_RUN=true` and Deploy (or stop the service). The restart
   forgets any in-flight order, so nothing cancels it client-side: the exchange
-  expires it within about 2 minutes, and its fill report may be lost. Best done
+  expires it within about 2 to 3 minutes, and its fill report may be lost. Best done
   between signal windows.
 - The relay operator can also pause signals or revoke your access from their
   side. If that happens the log shows `relay: ok halt=… signals=0` or
@@ -139,7 +139,7 @@ actually bought.
 
 ## Known limitations
 
-- A restart within ~2 minutes of placing an order can lose that order's fill
+- A restart within ~3 minutes of placing an order can lose that order's fill
   report (nothing is stored on disk). The trade is real; the report is missing.
 - A fill report that fails ambiguously (the relay may or may not have saved it)
   is **not retried**, because the relay doesn't de-duplicate; the full payload is
